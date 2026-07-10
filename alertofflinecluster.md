@@ -1,4 +1,6 @@
 # Catching Offline Managed Clusters Early: Adding `acm_managed_cluster_info` to the ACM Observability Allowlist
+
+tested with ACM 2.17 MCOA metrics enabled.
  
 If you run Red Hat Advanced Cluster Management (ACM) for Kubernetes at fleet scale, you already know the pain of finding out a managed cluster went offline only after someone complains. Out of the box, ACM's observability stack doesn't scrape and store every metric available on the hub — it relies on an **allowlist** (or a **custom scrape config**) to decide what gets collected and forwarded to Thanos.
  
