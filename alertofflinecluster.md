@@ -75,7 +75,7 @@ data:
               description: "The managed cluster {{ $labels.managed_cluster_id }} (cloud: {{ $labels.cloud }}, vendor: {{ $labels.vendor }}) is reporting availability as '{{ $labels.available }}' for more than 5 minutes."
  
       # -------------------------------------------------------------
-      # Telemetry Pipeline Health Alerting Rules (Case 2)
+      # Telemetry Pipeline Health Alerting Rules (Case 2) Use only one of them
       # -------------------------------------------------------------
       - name: telemetry-addon-alerts
         rules:
