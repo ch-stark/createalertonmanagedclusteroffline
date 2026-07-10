@@ -1,4 +1,4 @@
-# Catching Offline Managed Clusters Early: Adding `acm_managed_cluster_info` to the ACM Observability Allowlist
+# Catching Offline Managed Clusters Early: creating Alerts for metric `acm_managed_cluster_info` 
 
 tested with ACM 2.17 MCOA metrics enabled.
  
