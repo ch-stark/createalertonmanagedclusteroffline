@@ -4,8 +4,7 @@ If you run Red Hat Advanced Cluster Management (ACM) for Kubernetes at fleet sca
  
 One of the most useful metrics for fleet lifecycle monitoring, `acm_managed_cluster_info`, is **not enabled by default** today. Until it becomes a default metric in a future ACM release, you have to add it yourself. This post walks through why you'd want it, how to enable it, and how to wire up a critical alert that fires the moment a managed cluster drops offline.
  
----
- 
+
 ## Why `acm_managed_cluster_info` matters
  
 `acm_managed_cluster_info` is a metric exposed on the hub that reports the availability state of every managed cluster ACM knows about, including labels like:
@@ -18,8 +17,7 @@ Without this metric being scraped, you have no clean, label-rich signal to alert
  
 By enabling this metric and pairing it with a Thanos Ruler alerting rule, you get a **critical alert the moment a cluster's availability flips away from `True`**, surfaced directly in the ACM Alerting UI (and onward to Alertmanager/PagerDuty/Slack if you have those receivers configured).
  
----
- 
+
 ## Step 1 — Add the metric to the custom allowlist
  
 ACM Observability ships a `ConfigMap` called `observability-metrics-custom-allowlist` in the `open-cluster-management-observability` namespace. This is where you extend the default allowlist without touching the operator-managed default one.
@@ -45,8 +43,6 @@ oc -n open-cluster-management-observability edit configmap observability-metrics
 Alternatively, if you're scraping this from a custom target rather than the standard collector path, you can add it via a custom `ScrapeConfig` instead of the allowlist — the end result (the metric landing in Thanos) is the same.
  
 > **Note:** Once this metric graduates to the ACM default allowlist in a future release, this manual step won't be necessary. Until then, it needs to be added explicitly per hub.
- 
----
  
 ## Step 2 — Add the alerting rules
  
@@ -112,7 +108,6 @@ oc apply -f thanos-ruler-custom-rules.yaml
  
 The Thanos Ruler operator will pick up the change and reload the rule group automatically — no restart needed.
  
----
  
 ## Step 3 — Confirm the metric is flowing
  
@@ -125,7 +120,6 @@ oc -n open-cluster-management-observability exec -it <thanos-querier-pod> -- \
  
 You should see one time series per managed cluster, each carrying `managed_cluster_id`, `available`, `cloud`, and `vendor` labels.
  
----
  
 ## Step 4 — Watch it fire in the ACM Alerting UI
  
@@ -137,7 +131,6 @@ Clicking into the alert gives you the full label and annotation detail — clust
  
 ![Managed cluster offline alert detail view](alert_clusterofflinedetail.png)
  
----
  
 ## Wrapping up
  
