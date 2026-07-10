@@ -136,5 +136,51 @@ Clicking into the alert gives you the full label and annotation detail — clust
  
 ## Wrapping up
  
-Two small ConfigMap edits — one allowlist entry, one alerting rule — turn a metric that used to just sit unused into a proactive, fleet-wide "a cluster just went dark" signal inside ACM's native Alerting UI. Until `acm_managed_cluster_info` ships in the default allowlist, this is a quick and low-risk change worth rolling out to every hub in your environment.
+Two small ConfigMap edits — one allowlist entry, one alerting rule — turn a metric that used to just sit unused into a proactive, fleet-wide "a cluster just went dark" signal inside ACM's native Alerting UI. Until `acm_managed_cluster_info` ships in the default allowlist, this is a quick and low-risk change worth 
+rolling out to every hub in your environment.
  
+We will also test a Policy based approach where a Policy triggers an Alert (e.g.)
+
+```yaml
+policy-templates:
+  - objectDefinition:
+      apiVersion: policy.open-cluster-management.io/v1
+      kind: ConfigurationPolicy
+      metadata:
+        name: policy-cluster-availability-audit
+      spec:
+        severity: critical
+        remediationAction: inform
+        # Changed to '|' to ensure YAML blocks evaluate correctly inside the template
+        object-templates-raw: |
+          {{- /* 1. API FILTERING: Retrieve only ManagedClusters that do NOT have the local-cluster label */ -}}
+          {{- range $cluster := (lookup "cluster.open-cluster-management.io/v1" "ManagedCluster" "" "" "!local-cluster").items }}
+            
+            {{- $isAvailable := false }}
+            
+            {{- /* 2. Scan conditions for ManagedClusterConditionAvailable = True */ -}}
+            {{- if $cluster.status.conditions }}
+              {{- range $cond := $cluster.status.conditions }}
+                {{- if or (eq $cond.type "ManagedClusterConditionAvailable") (eq $cond.type "Available") }}
+                  {{- if eq $cond.status "True" }}
+                    {{- $isAvailable = true }}
+                  {{- end }}
+                {{- end }}
+              {{- end }}
+            {{- end }}
+            
+            {{- /* 3. If the cluster is unavailable, trigger a violation under inform mode */ -}}
+            {{- if not $isAvailable }}
+          - complianceType: musthave
+            objectDefinition:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: cluster-{{ $cluster.metadata.name }}-is-offline
+                namespace: default
+              data:
+                message: "The managed cluster {{ $cluster.metadata.name }} is currently unavailable or unreachable."
+            {{- end }}
+          {{- end }}
+```
+
