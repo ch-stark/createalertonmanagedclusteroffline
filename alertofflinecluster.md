@@ -18,7 +18,7 @@ Without this metric being scraped, you have no clean, label-rich signal to alert
 By enabling this metric and pairing it with a Thanos Ruler alerting rule, you get a **critical alert the moment a cluster's availability flips away from `True`**, surfaced directly in the ACM Alerting UI (and onward to Alertmanager/PagerDuty/Slack if you have those receivers configured).
  
 
-## Step 1 — Add the metric to the custom allowlist
+## Step 1 — Add the metric to the custom allowlist (or into a scrapeconfig if you use MCOA)
  
 ACM Observability ships a `ConfigMap` called `observability-metrics-custom-allowlist` in the `open-cluster-management-observability` namespace. This is where you extend the default allowlist without touching the operator-managed default one.
  
