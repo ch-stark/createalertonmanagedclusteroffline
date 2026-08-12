@@ -1,7 +1,6 @@
 # RHACM 2.17 Observability Alert Configuration
  
-Thank you for confirming you are on RHACM 2.17 with the multicluster observability add-on (MCOA) enabled. Below is where each workaround is configured on your hub cluster.
- 
+
 ## Problem Statement
  
 Several of the hub-side metrics used for alerting only carry an opaque `managed_cluster_id` (a UUID) — not the human-readable cluster name. If an alert template uses `{{ $labels.managed_cluster_id }}` directly, the summary/description shows something like `4f2a1c9e-7b3d-4e21-9f6a-...` instead of `east-region-prod`, which isn't useful when triaging an alert at 2am.
