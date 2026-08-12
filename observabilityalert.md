@@ -1,5 +1,22 @@
 # RHACM 2.17 Observability Alert Configuration
-
+ 
+Thank you for confirming you are on RHACM 2.17 with the multicluster observability add-on (MCOA) enabled. Below is where each workaround is configured on your hub cluster.
+ 
+## Problem Statement
+ 
+Several of the hub-side metrics used for alerting only carry an opaque `managed_cluster_id` (a UUID) — not the human-readable cluster name. If an alert template uses `{{ $labels.managed_cluster_id }}` directly, the summary/description shows something like `4f2a1c9e-7b3d-4e21-9f6a-...` instead of `east-region-prod`, which isn't useful when triaging an alert at 2am.
+ 
+**Goal:** every alert annotation below should resolve to the real managed cluster *name*, not its ID.
+ 
+| Metric | Has the name natively? | What it has instead |
+|---|---|---|
+| Forwarded fleet metrics (e.g. `kube_node_status_allocatable`) | ✅ `cluster` label | — |
+| `acm_managed_cluster_info` | ❌ | `managed_cluster_id` only |
+| `policyreport_info` | ❌ | `managed_cluster_id` only |
+| `acm_managed_cluster_labels` (the lookup table) | ✅ `name` label | `managed_cluster_id` (used as the join key) |
+| `acm_managed_cluster_status_condition` | ✅ `managed_cluster_name` label | — |
+ 
+Where a metric is missing the name (rows 2–3 above), the workaround joins it against `acm_managed_cluster_labels` — the metric that maps `managed_cluster_id` → `name` — using `group_left`, so the real name rides along into the alert's labels and annotations.
  
 ## Where Observability Alert Configuration Lives
  
@@ -66,6 +83,8 @@ kube_node_status_allocatable{resource="cpu"}
  
 Confirm `cluster` and `clusterID` appear in the label set.
  
+> **Why no join is needed:** unlike Workarounds 2 and 3, metrics forwarded from managed clusters already carry the `cluster` label at the source — no lookup against `acm_managed_cluster_labels` required.
+ 
 ---
  
 ## Workaround 2: Alerts Based on `acm_managed_cluster_info`
@@ -98,6 +117,17 @@ data:
               summary: "Cluster {{ $labels.name }} is unavailable"
               description: "Managed cluster {{ $labels.name }} (ID: {{ $labels.managed_cluster_id }}) is not available."
 ```
+ 
+**Why this join is needed:** `acm_managed_cluster_info` only exposes `managed_cluster_id`, never a name. This part of the query:
+ 
+```
+* on (managed_cluster_id) group_left (name)
+  max by (managed_cluster_id, name) (acm_managed_cluster_labels)
+```
+ 
+looks up that ID in `acm_managed_cluster_labels` and copies its `name` label onto the result. Without it, `{{ $labels.name }}` renders empty and you're stuck alerting on the raw UUID.
+ 
+> **Shortcut:** if your alert condition can instead be expressed against `acm_managed_cluster_status_condition` (e.g. availability/condition-based alerts), that metric already carries `managed_cluster_name` natively — no join required.
  
 Verify in Grafana Explore:
  
@@ -148,6 +178,8 @@ data:
               summary: "Policy violation on cluster {{ $labels.cluster }}"
               description: "Policy {{ $labels.policy }} (severity: {{ $labels.severity }}) on cluster {{ $labels.cluster }}."
 ```
+ 
+**Why this join is needed:** `policyreport_info` also only carries `managed_cluster_id`, not a name. `label_replace(acm_managed_cluster_labels, "cluster", "$1", "name", "(.*)")` copies the value of `acm_managed_cluster_labels`'s `name` label into a new label called `cluster` (matching what the rest of the query groups by), then `group_left (cluster)` attaches it the same way as Workaround 2. Net effect: `{{ $labels.cluster }}` in the annotation is the real name, not the ID.
  
 ---
  
