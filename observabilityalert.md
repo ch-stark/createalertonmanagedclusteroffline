@@ -1,6 +1,5 @@
 # RHACM 2.17 Observability Alert Configuration
- 
-Thank you for confirming you are on RHACM 2.17 with the multicluster observability add-on (MCOA) enabled. Below is where each workaround is configured on your hub cluster.
+
  
 ## Where Observability Alert Configuration Lives
  
