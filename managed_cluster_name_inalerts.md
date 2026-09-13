@@ -1,5 +1,13 @@
-# RHACM 2.17 Observability Alert Configuration
- 
+# RHACM Observability: cluster name in alert annotations
+
+This is the customer workaround write-up in
+[`ch-stark/createalertonmanagedclusteroffline`](https://github.com/ch-stark/createalertonmanagedclusteroffline/blob/main/managed_cluster_name_inalerts.md)
+(`managed_cluster_name_inalerts.md`). It was originally written against **RHACM 2.17**.
+Use the **ACM 2.13** section below if that is the hub version under support.
+
+Native `managed_cluster_name` on `acm_managed_cluster_info` / `policyreport_info` is
+[ACM-41089](https://issues.redhat.com/browse/ACM-41089) (currently targeted at ACM 5.1).
+Until that ships on the customer's version, put the name on the **alert**, not the metric.
 
 ## Problem Statement
  
@@ -16,8 +24,142 @@ Several of the hub-side metrics used for alerting only carry an opaque `managed_
 | `acm_managed_cluster_status_condition` | ✅ `managed_cluster_name` label | — |
  
 Where a metric is missing the name (rows 2–3 above), the workaround joins it against `acm_managed_cluster_labels` — the metric that maps `managed_cluster_id` → `name` — using `group_left`, so the real name rides along into the alert's labels and annotations.
- 
-## Where Observability Alert Configuration Lives
+
+A join **without** collapsing `acm_managed_cluster_labels` first will fail with Thanos `422` / `many-to-many matching not allowed` (duplicate series). That metric is one timeseries per cluster **and** label-set, so a day-2 ManagedCluster label change leaves two series for the same ID until the old set expires. This is [ACM-30479](https://issues.redhat.com/browse/ACM-30479), not a customer PromQL error.
+
+| Hub version | Built-in `ViolatedPolicyReport` join | What to give the customer |
+|---|---|---|
+| **2.13** (and 2.14 / 2.15 until the clone ships) | **Unsafe** — no `max by` collapse | Custom rules only (this 2.13 section) |
+| 2.16.3, 2.17.1, 5.0.0+ | Join fixed in default rules ([ACM-30479](https://issues.redhat.com/browse/ACM-30479)) | Workarounds 1–3 below; default policy rule is OK |
+| 5.1+ (ACM-41089) | Native name labels (planned) | No join required once the metric carries `managed_cluster_name` |
+
+---
+
+## ACM 2.13 workaround (what to send the customer)
+
+On 2.13, `acm_managed_cluster_info` and `policyreport_info` are documented as **Stable** with `managed_cluster_id` and **no** cluster name
+([Observability 2.13](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.13/html/observability/observing-environments-intro)).
+Do **not** tell a 2.13 customer to rely on ConfigMap `thanos-ruler-default-rules` / alert `ViolatedPolicyReport` for the name — that default expr is the broken join.
+
+Put custom rules only in ConfigMap `thanos-ruler-custom-rules` in namespace `open-cluster-management-observability`.
+Have them confirm label names in Grafana Explore on **their** hub before they copy annotations (`managed_cluster_name` vs `name`).
+
+### 2.13-A — Unavailable cluster (preferred: no join)
+
+`acm_managed_cluster_status_condition` exists from ACM 2.7 and already carries `managed_cluster_name`.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: thanos-ruler-custom-rules
+  namespace: open-cluster-management-observability
+data:
+  custom_rules.yaml: |
+    groups:
+      - name: acm-cluster-availability
+        rules:
+          - alert: ManagedClusterUnavailable
+            expr: |
+              acm_managed_cluster_status_condition{
+                condition="ManagedClusterConditionAvailable",
+                status!="True"
+              } == 1
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Cluster {{ $labels.managed_cluster_name }} is unavailable"
+              description: "Managed cluster {{ $labels.managed_cluster_name }} availability is not True."
+```
+
+Verify first:
+
+```
+count by (managed_cluster_name, condition, status) (acm_managed_cluster_status_condition)
+```
+
+### 2.13-B — Must use `acm_managed_cluster_info`
+
+`max by` is required. `last_over_time` covers the ~10 minute overlap while both old and new `acm_managed_cluster_labels` series exist.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: thanos-ruler-custom-rules
+  namespace: open-cluster-management-observability
+data:
+  custom_rules.yaml: |
+    groups:
+      - name: acm-cluster-info
+        rules:
+          - alert: ManagedClusterUnavailable
+            expr: |
+              acm_managed_cluster_info{available!="True"}
+              * on (managed_cluster_id) group_left (name)
+                max by (managed_cluster_id, name) (
+                  last_over_time(acm_managed_cluster_labels[10m])
+                )
+            for: 5m
+            labels:
+              severity: critical
+              cluster: "{{ $labels.name }}"
+            annotations:
+              summary: "Cluster {{ $labels.name }} is unavailable"
+              description: "Managed cluster {{ $labels.name }} (ID: {{ $labels.managed_cluster_id }}) is not available."
+```
+
+A `group_left` **without** `max by` / `last_over_time` is what produces duplicate series.
+
+### 2.13-C — Policy violations (custom rule only)
+
+Do not use the 2.13 built-in `ViolatedPolicyReport` for this. Add a custom rule:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: thanos-ruler-custom-rules
+  namespace: open-cluster-management-observability
+data:
+  custom_rules.yaml: |
+    groups:
+      - name: policy-reports-custom
+        rules:
+          - alert: CustomPolicyViolation
+            expr: |
+              sum by (name, policy, severity) (
+                policyreport_info{result="fail"}
+                * on (managed_cluster_id) group_left (name)
+                  max by (managed_cluster_id, name) (
+                    last_over_time(acm_managed_cluster_labels[10m])
+                  )
+              ) > 0
+            for: 1m
+            labels:
+              severity: "{{ $labels.severity }}"
+            annotations:
+              summary: "Policy violation on cluster {{ $labels.name }}"
+              description: "Policy {{ $labels.policy }} (severity: {{ $labels.severity }}) on cluster {{ $labels.name }}."
+```
+
+If they used `max by` and still see **two ALERT series** for one violation, check for leftover MCOA `PrometheusRules` plus MCO evaluating the same alert ([ACM-34481](https://issues.redhat.com/browse/ACM-34481)) — that is a second evaluator, not a bad join.
+
+Apply on the hub:
+
+```bash
+oc apply -f thanos-ruler-custom-rules.yaml -n open-cluster-management-observability
+```
+
+Confirm in Grafana Explore: `ALERTS{alertname="ManagedClusterUnavailable"}`.
+If Thanos ruler logs show `422` / `many-to-many matching not allowed`, the custom expr is still joining raw `acm_managed_cluster_labels` without the collapse.
+
+This workaround puts the name on the **alert**. It does not change 2.13 metric cardinality or ship ACM-41089.
+
+---
+
+## Where Observability Alert Configuration Lives (2.17 and later)
  
 All of the following resources are on the hub cluster, in namespace `open-cluster-management-observability`.
  
@@ -138,10 +280,12 @@ acm_managed_cluster_labels
 ---
  
 ## Workaround 3: Policy Violation Alerts (`policyreport_info`)
- 
-**Where:** Built-in rule in ConfigMap `thanos-ruler-default-rules` on the hub.
- 
-**What to use:** `{{ $labels.cluster }}` in alert annotations — the default `ViolatedPolicyReport` rule already joins `policyreport_info` to `acm_managed_cluster_labels`.
+
+**2.13:** skip this section. The built-in `ViolatedPolicyReport` join is unsafe on 2.13. Use **2.13-C** above.
+
+**Where (2.16.3 / 2.17.1 / 5.0+):** Built-in rule in ConfigMap `thanos-ruler-default-rules` on the hub.
+
+**What to use:** `{{ $labels.cluster }}` in alert annotations — after [ACM-30479](https://issues.redhat.com/browse/ACM-30479), the default `ViolatedPolicyReport` rule joins `policyreport_info` to `acm_managed_cluster_labels` **and** collapses duplicate label-sets with `max by`.
  
 View the built-in rule (do not edit unless directed by support):
  
@@ -216,8 +360,10 @@ Custom notification templates go under the `templates:` key in `alertmanager.yam
  
 ---
  
-## Important Notes for RHACM 2.17
- 
+## Important Notes
+
 - Do not edit `thanos-ruler-default-rules` for custom alerts — use `thanos-ruler-custom-rules`. The operator manages the default ConfigMap.
-- `acm_managed_cluster_info` does not have `managed_cluster_name` on 2.17. Use the join to `acm_managed_cluster_labels` as shown above, or use `acm_managed_cluster_status_condition` if that metric fits your use case (it does include `managed_cluster_name`).
+- On **2.13**, do not point customers at the built-in `ViolatedPolicyReport` for cluster name. That default join lacks the ACM-30479 `max by` collapse.
+- `acm_managed_cluster_info` does not have `managed_cluster_name` on 2.13 or 2.17. Use the collapsed join to `acm_managed_cluster_labels`, or use `acm_managed_cluster_status_condition` for availability (it does include `managed_cluster_name`).
 - Do not add Prometheus external labels on managed clusters expecting them to appear on hub-scraped metrics like `acm_managed_cluster_info` — those metrics are emitted on the hub by `clusterlifecycle-state-metrics`, not on the managed cluster.
+- Native name labels on those two metrics: [ACM-41089](https://issues.redhat.com/browse/ACM-41089) (ACM 5.1). Do not promise that on a 2.13 hub.
