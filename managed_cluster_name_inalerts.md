@@ -45,7 +45,10 @@ These hub metrics are emitted by `clusterlifecycle-state-metrics` on the hub (`b
 
 ### What 2.13 actually emits
 
-Confirmed from `stolostron/clusterlifecycle-state-metrics` branch `backplane-2.8`.
+Confirmed from `stolostron/clusterlifecycle-state-metrics` branch [`backplane-2.8`](https://github.com/stolostron/clusterlifecycle-state-metrics/tree/backplane-2.8):
+[`managedclusterinfo.go`](https://github.com/stolostron/clusterlifecycle-state-metrics/blob/backplane-2.8/pkg/generators/cluster/managedclusterinfo.go),
+[`managedclusterlabels.go`](https://github.com/stolostron/clusterlifecycle-state-metrics/blob/backplane-2.8/pkg/generators/cluster/managedclusterlabels.go),
+[`managedclusterstatus.go`](https://github.com/stolostron/clusterlifecycle-state-metrics/blob/backplane-2.8/pkg/generators/cluster/managedclusterstatus.go).
 
 **`acm_managed_cluster_info`** — no name. Labels: `hub_cluster_id`, `managed_cluster_id`, `vendor`, `cloud`, `service_name`, `version`, `available`, `created_via`, `core_worker`, `socket_worker`, `hub_type`, `product`.
 
@@ -102,7 +105,7 @@ On 2.13 the lookup table must be `acm_managed_cluster_status_condition` (`manage
 
 | Jira | What it is | On 2.13? |
 |---|---|---|
-| [ACM-41089](https://issues.redhat.com/browse/ACM-41089) | Native `managed_cluster_name` on `acm_managed_cluster_info` / `policyreport_info` (later PRs: clusterlifecycle-state-metrics#677, insights-metrics#554) | **No** — targeted at ACM 5.1 |
+| [ACM-41089](https://issues.redhat.com/browse/ACM-41089) | Native `managed_cluster_name` on `acm_managed_cluster_info` / `policyreport_info` ([clusterlifecycle-state-metrics#677](https://github.com/stolostron/clusterlifecycle-state-metrics/pull/677), [insights-metrics#554](https://github.com/stolostron/insights-metrics/pull/554)) | **No** — targeted at ACM 5.1 |
 | [ACM-30479](https://issues.redhat.com/browse/ACM-30479) | Default `ViolatedPolicyReport` missing `max by` | **No** — 2.16.3 / 2.17.1 / 5.0 |
 | [ACM-42977](https://issues.redhat.com/browse/ACM-42977) | ACM-30479 clone for 2.14.z / 2.15.z | **No** 2.13 clone |
 | [ACM-34481](https://issues.redhat.com/browse/ACM-34481) | Leftover MCOA `PrometheusRules` plus MCO evaluating the same alert (two ALERT series after a *good* join) | Possible; check if they still see duplicates after 2.13-C |
@@ -120,13 +123,46 @@ Have them confirm labels in Grafana Explore on **their** hub before copying anno
 
 ### Support reply (copy)
 
-Summary:
+**Summary**
 
-On ACM 2.13, `acm_managed_cluster_info` and `policyreport_info` only have `managed_cluster_id`, not a cluster name. That is expected. Native `managed_cluster_name` on those metrics is ACM-41089 and is not in 2.13.
+On ACM 2.13, `acm_managed_cluster_info` and `policyreport_info` only have `managed_cluster_id`, not a cluster name. That is expected ([Observability 2.13](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.13/html/observability/observing-environments-intro)). Native `managed_cluster_name` on those metrics is ACM-41089 and is not in 2.13.
 
-The error `match group {}` with two different names (`ilab-ctigtdc15d` vs `ilab-ctigtdcspk1d`) means the join is not keyed on `managed_cluster_id`. Those are two ManagedCluster names. ManagedCluster `metadata.name` does not change, so this is not a stale rename. It is not ACM-30479 (that bug is the default `ViolatedPolicyReport` rule, same name, match group `{managed_cluster_id="…"}`, fixed in 2.16.3 / 2.17.1 / 5.0, not on 2.13).
+The error is not “one cluster with two names because Prometheus kept a stale series.” An empty match group `{}` means the join is **not keyed on `managed_cluster_id`**. Prometheus then puts every right-hand series in one bucket, so two different clusters collide:
 
-Workaround: for availability, alert on `acm_managed_cluster_status_condition` (it already has `managed_cluster_name`). If you must join `acm_managed_cluster_info`, look the name up from status condition with `on (managed_cluster_id)` — see 2.13-A / 2.13-B / 2.13-C in this write-up.
+```
+found duplicate series for the match group {} on the right-hand side of the operation:
+[{name="ilab-ctigtdc15d"}, {name="ilab-ctigtdcspk1d"}];
+many-to-many matching not allowed: matching labels must be unique on one side
+```
+
+Those are two ManagedCluster names. ManagedCluster `metadata.name` does not change, so this is not a rename with a leftover series. On 2.13 the `name` label comes from `acm_managed_cluster_labels` (only if that key exists on the object). `acm_managed_cluster_info` has no `name`.
+
+This is **not** ACM-30479. That bug is the default `ViolatedPolicyReport` rule: extra labels, **same** cluster name, match group `{managed_cluster_id="…"}`. It was fixed for 2.16.3 / 2.17.1 / 5.0; ACM-42977 covers 2.14.z / 2.15.z. That change does not add names to `acm_managed_cluster_info`, does not land on 2.13, and will not fix this custom join.
+
+**Workaround (ACM 2.13)**
+
+Preferred — no join. Alert on status condition; it already has `managed_cluster_name`:
+
+```promql
+acm_managed_cluster_status_condition{
+  condition="ManagedClusterConditionAvailable",
+  status!="True"
+} == 1
+```
+
+If you must use `acm_managed_cluster_info`, look the name up from status condition. Join **only** on the ID:
+
+```promql
+acm_managed_cluster_info{available!="True"}
+* on(managed_cluster_id) group_left(managed_cluster_name)
+  topk by (managed_cluster_id) (1,
+    max by (managed_cluster_id, managed_cluster_name) (
+      last_over_time(acm_managed_cluster_status_condition[10m])
+    )
+  )
+```
+
+Do not join `acm_managed_cluster_labels` on `name`, and do not use `on()` with no labels. `topk` is only a guard if two ManagedClusters share a `managed_cluster_id`; it picks one name. Please try this in the hub Console and send the result (or a new error).
 
 ---
 
