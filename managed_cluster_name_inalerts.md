@@ -3,7 +3,7 @@
 This is the customer workaround write-up in
 [`ch-stark/createalertonmanagedclusteroffline`](https://github.com/ch-stark/createalertonmanagedclusteroffline/blob/main/managed_cluster_name_inalerts.md)
 (`managed_cluster_name_inalerts.md`). It was originally written against **RHACM 2.17**.
-Use the **ACM 2.13** section below if that is the hub version under support.
+Use the **ACM 2.13 analysis** and **workaround** sections below if that is the hub version under support.
 
 Native `managed_cluster_name` on `acm_managed_cluster_info` / `policyreport_info` is
 [ACM-41089](https://issues.redhat.com/browse/ACM-41089) (currently targeted at ACM 5.1).
@@ -35,14 +35,105 @@ Where a metric is missing the name (rows 2–3), put it on the **alert** with a 
 
 ---
 
-## ACM 2.13 workaround (what to send the customer) 
+## ACM 2.13 analysis
 
-On 2.13, `acm_managed_cluster_info` and `policyreport_info` are documented as **Stable** with `managed_cluster_id` and **no** cluster name
+The customer claim is valid: on a 2.13 hub, `acm_managed_cluster_info` and `policyreport_info` do not carry a human-readable cluster name. That is documented as **Stable**
 ([Observability 2.13](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.13/html/observability/observing-environments-intro)).
-Do **not** tell a 2.13 customer to rely on ConfigMap `thanos-ruler-default-rules` / alert `ViolatedPolicyReport` for the name — that default expr is the broken join.
+Native `managed_cluster_name` on those two metrics is [ACM-41089](https://issues.redhat.com/browse/ACM-41089) (ACM 5.1). Do not promise it on 2.13.
+
+These hub metrics are emitted by `clusterlifecycle-state-metrics` on the hub (`backplane-2.8` ≈ ACM 2.13), not by Prometheus on the managed cluster. Adding Prometheus external labels on spokes will not appear on `acm_managed_cluster_info`.
+
+### What 2.13 actually emits
+
+Confirmed from `stolostron/clusterlifecycle-state-metrics` branch `backplane-2.8`.
+
+**`acm_managed_cluster_info`** — no name. Labels: `hub_cluster_id`, `managed_cluster_id`, `vendor`, `cloud`, `service_name`, `version`, `available`, `created_via`, `core_worker`, `socket_worker`, `hub_type`, `product`.
+
+When `available`, `version`, vendor, or cores change, Prometheus/Thanos can keep the old and new label sets alive for a few minutes. That is two series for the **same** ID with different *other* labels — not two names.
+
+**`acm_managed_cluster_labels`** — defaults are only `hub_cluster_id` and `managed_cluster_id`. Every label on the ManagedCluster object is then copied on as a Prometheus label. `name` exists **only if** the object has a `name=` label; it is not a dedicated field. This metric is one series per cluster **and** label-set, so a day-2 label edit leaves two series for the same ID until the old set expires.
+
+**`acm_managed_cluster_status_condition`** — present since ACM 2.7. On 2.13 it has `managed_cluster_id` (from the clusterID claim; falls back to `metadata.name` if empty) and `managed_cluster_name` (`mc.GetName()`, the ManagedCluster name). Extra labels are `condition` and `status`. Many series per cluster is **by design**, not label churn. ManagedCluster `metadata.name` is immutable, so this metric cannot grow a second name for one cluster because of a rename.
+
+**`policyreport_info`** — `managed_cluster_id` only. No name on 2.13.
+
+**Forwarded fleet metrics** (for example `kube_node_status_allocatable`) — already have `cluster` (ManagedCluster name) and `clusterID`. No join needed. Workaround 1 below is safe on 2.13.
+
+`getClusterID()` uses the OpenShift clusterID claim when present, otherwise `metadata.name`. Two OpenShift clusters that somehow share a clusterID can collide on `managed_cluster_id`; that is a data problem, not stale Prometheus names.
+
+### Two different 422 errors
+
+Thanos `many-to-many matching not allowed` is not one bug. Read the match group.
+
+**Empty match group — customer PromQL, not ACM-30479**
+
+```
+found duplicate series for the match group {} on the right-hand side of the operation:
+[{name="ilab-ctigtdc15d"}, {name="ilab-ctigtdcspk1d"}];
+many-to-many matching not allowed: matching labels must be unique on one side
+```
+
+`{}` means the join is **not keyed on `managed_cluster_id`**: `on()`, `on(name)`, or the right side dropped the ID (`max by (name)`). Prometheus puts every right-hand series in one bucket. The two `name` values are two ManagedClusters (typical lab hostnames). That is not a rename with a leftover series.
+
+`max by (managed_cluster_id, name)` does not fix this. If the join is not `on (managed_cluster_id)`, collapse never runs on the ID. If two different names share an ID, `max by (id, name)` **keeps both rows**.
+
+**Match group with the ID — ACM-30479 shape**
+
+```
+match group {managed_cluster_id="62f2c026-…"}
+```
+
+same cluster name, extra labels (for example a day-2 ManagedCluster label). That is labels-metric cardinality. The default `ViolatedPolicyReport` expr on 2.13 joins without `max by`, so it hits this. [ACM-30479](https://issues.redhat.com/browse/ACM-30479) fixed that default rule in **2.16.3 / 2.17.1 / 5.0**. [ACM-42977](https://issues.redhat.com/browse/ACM-42977) is the 2.14.z / 2.15.z clone (no 2.13 clone). ACM-30479 does **not** add names to `acm_managed_cluster_info`, does not change status-condition cardinality, and does not fix a custom join with `match group {}`.
+
+Do not tell the customer “Prometheus kept two names for one cluster because labels changed” and do not point them at ACM-30479 for the empty-match-group error.
+
+### What collapses what
+
+| Construct | Fixes | Does not fix |
+|---|---|---|
+| `on (managed_cluster_id)` | empty match group `{}` | extra labels on the right side |
+| `max by (managed_cluster_id, name)` | extra labels, **same** name (ACM-30479) | `{}`; two different names for one ID |
+| `topk by (managed_cluster_id) (1, …)` | forces one right-hand row per ID | if two clusters share a clusterID, the name is arbitrary |
+| `last_over_time(...[10m])` | Thanos scrape gaps / brief overlap | a missing join key |
+
+On 2.13 the lookup table must be `acm_managed_cluster_status_condition` (`managed_cluster_name`), not `acm_managed_cluster_labels` (`name`).
+
+### Jiras (do not mix)
+
+| Jira | What it is | On 2.13? |
+|---|---|---|
+| [ACM-41089](https://issues.redhat.com/browse/ACM-41089) | Native `managed_cluster_name` on `acm_managed_cluster_info` / `policyreport_info` (later PRs: clusterlifecycle-state-metrics#677, insights-metrics#554) | **No** — targeted at ACM 5.1 |
+| [ACM-30479](https://issues.redhat.com/browse/ACM-30479) | Default `ViolatedPolicyReport` missing `max by` | **No** — 2.16.3 / 2.17.1 / 5.0 |
+| [ACM-42977](https://issues.redhat.com/browse/ACM-42977) | ACM-30479 clone for 2.14.z / 2.15.z | **No** 2.13 clone |
+| [ACM-34481](https://issues.redhat.com/browse/ACM-34481) | Leftover MCOA `PrometheusRules` plus MCO evaluating the same alert (two ALERT series after a *good* join) | Possible; check if they still see duplicates after 2.13-C |
+
+### What to send / not send
+
+| Send | Do not send |
+|---|---|
+| **2.13-A** for unavailable-cluster (preferred, no join) | Workaround 2 / 3 `acm_managed_cluster_labels` + `name` join |
+| **2.13-B / 2.13-C** if they must alert on `acm_managed_cluster_info` or `policyreport_info` | Built-in `ViolatedPolicyReport` on 2.13 (`thanos-ruler-default-rules`) |
+| Custom rules only in `thanos-ruler-custom-rules` | “This is ACM-30479; it will be fixed in 2.16.3 / 2.17.1 / 5.0” as the answer to `match group {}` |
+| | ACM-41089 as a 2.13 fix |
+
+Have them confirm labels in Grafana Explore on **their** hub before copying annotations (`managed_cluster_name` vs `name`).
+
+### Support reply (copy)
+
+Summary:
+
+On ACM 2.13, `acm_managed_cluster_info` and `policyreport_info` only have `managed_cluster_id`, not a cluster name. That is expected. Native `managed_cluster_name` on those metrics is ACM-41089 and is not in 2.13.
+
+The error `match group {}` with two different names (`ilab-ctigtdc15d` vs `ilab-ctigtdcspk1d`) means the join is not keyed on `managed_cluster_id`. Those are two ManagedCluster names. ManagedCluster `metadata.name` does not change, so this is not a stale rename. It is not ACM-30479 (that bug is the default `ViolatedPolicyReport` rule, same name, match group `{managed_cluster_id="…"}`, fixed in 2.16.3 / 2.17.1 / 5.0, not on 2.13).
+
+Workaround: for availability, alert on `acm_managed_cluster_status_condition` (it already has `managed_cluster_name`). If you must join `acm_managed_cluster_info`, look the name up from status condition with `on (managed_cluster_id)` — see 2.13-A / 2.13-B / 2.13-C in this write-up.
+
+---
+
+## ACM 2.13 workaround (what to send the customer)
 
 Put custom rules only in ConfigMap `thanos-ruler-custom-rules` in namespace `open-cluster-management-observability`.
-Have them confirm label names in Grafana Explore on **their** hub before they copy annotations (`managed_cluster_name` vs `name`).
+Do **not** tell a 2.13 customer to rely on ConfigMap `thanos-ruler-default-rules` / alert `ViolatedPolicyReport` for the name — that default expr is the ACM-30479 join (no `max by`).
 
 ### 2.13-A — Unavailable cluster (preferred: no join)
 
@@ -158,10 +249,25 @@ oc apply -f thanos-ruler-custom-rules.yaml -n open-cluster-management-observabil
 
 Confirm in Grafana Explore: `ALERTS{alertname="ManagedClusterUnavailable"}`.
 
+On-hub checks before arguing about duplicates:
+
+```
+# info: should be one series per ID unless available/version/cores just changed
+count by (managed_cluster_id) (acm_managed_cluster_info)
+
+# status condition: many series per cluster is expected (condition × status)
+count by (managed_cluster_id, managed_cluster_name) (acm_managed_cluster_status_condition)
+
+# labels: name is optional; this is not the 2.13 lookup table
+count by (managed_cluster_id, name) (acm_managed_cluster_labels)
+```
+
 If Thanos ruler logs show `422` / `many-to-many matching not allowed`:
 
 - **`match group {}`** with two different cluster names — the join is not keyed on `managed_cluster_id` (for example `on()`, or the right side dropped the ID). Use 2.13-B/C as written. This is not ACM-30479.
 - **`match group {managed_cluster_id="…"}`** with the **same** name and extra labels — labels-metric cardinality; collapse with `max by`. That is the ACM-30479 shape (default `ViolatedPolicyReport` on 2.13).
+
+If the join is good and they still see **two ALERT series**, that is [ACM-34481](https://issues.redhat.com/browse/ACM-34481) (two evaluators), not a bad join.
 
 This workaround puts the name on the **alert**. It does not change 2.13 metric cardinality or ship ACM-41089.
 
@@ -373,7 +479,7 @@ Custom notification templates go under the `templates:` key in `alertmanager.yam
 ## Important Notes
 
 - Do not edit `thanos-ruler-default-rules` for custom alerts — use `thanos-ruler-custom-rules`. The operator manages the default ConfigMap.
-- On **2.13**, do not point customers at the built-in `ViolatedPolicyReport` for cluster name. That default join lacks the ACM-30479 `max by` collapse.
+- On **2.13**, read **ACM 2.13 analysis** above before sending a Jira. Empty `match group {}` is a missing join key, not ACM-30479. Do not point customers at the built-in `ViolatedPolicyReport` for cluster name.
 - `acm_managed_cluster_info` does not have `managed_cluster_name` on 2.13 or 2.17. On 2.13, look the name up from `acm_managed_cluster_status_condition` with `on (managed_cluster_id)` (2.13-B/C). For availability-only alerts, use 2.13-A and skip the join. Do not join `acm_managed_cluster_labels` on `name`.
 - Do not add Prometheus external labels on managed clusters expecting them to appear on hub-scraped metrics like `acm_managed_cluster_info` — those metrics are emitted on the hub by `clusterlifecycle-state-metrics`, not on the managed cluster.
 - Native name labels on those two metrics: [ACM-41089](https://issues.redhat.com/browse/ACM-41089) (ACM 5.1). Do not promise that on a 2.13 hub.
