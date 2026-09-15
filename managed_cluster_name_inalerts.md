@@ -20,12 +20,12 @@ Several of the hub-side metrics used for alerting only carry an opaque `managed_
 | Forwarded fleet metrics (e.g. `kube_node_status_allocatable`) | ✅ `cluster` label | — |
 | `acm_managed_cluster_info` | ❌ | `managed_cluster_id` only |
 | `policyreport_info` | ❌ | `managed_cluster_id` only |
-| `acm_managed_cluster_labels` (the lookup table) | ✅ `name` label | `managed_cluster_id` (used as the join key) |
-| `acm_managed_cluster_status_condition` | ✅ `managed_cluster_name` label | — |
- 
-Where a metric is missing the name (rows 2–3 above), the workaround joins it against `acm_managed_cluster_labels` — the metric that maps `managed_cluster_id` → `name` — using `group_left`, so the real name rides along into the alert's labels and annotations.
+| `acm_managed_cluster_labels` | `name` **only if** that key exists on the ManagedCluster object | `managed_cluster_id` plus every MC label; not a reliable name source on 2.13 |
+| `acm_managed_cluster_status_condition` | ✅ `managed_cluster_name` (`metadata.name`) | also `managed_cluster_id` on 2.13 |
 
-A join **without** collapsing `acm_managed_cluster_labels` first will fail with Thanos `422` / `many-to-many matching not allowed` (duplicate series). That metric is one timeseries per cluster **and** label-set, so a day-2 ManagedCluster label change leaves two series for the same ID until the old set expires. This is [ACM-30479](https://issues.redhat.com/browse/ACM-30479), not a customer PromQL error.
+Where a metric is missing the name (rows 2–3), put it on the **alert** with a join. On **2.13**, use `acm_managed_cluster_status_condition` as the lookup (`on (managed_cluster_id)` → `managed_cluster_name`). Do not join `acm_managed_cluster_labels` on `name`: that label is not first-class, and a join that is not keyed on `managed_cluster_id` fails with Thanos `422` / `match group {}` / `many-to-many matching not allowed`.
+
+[ACM-30479](https://issues.redhat.com/browse/ACM-30479) is a **different** failure: the default `ViolatedPolicyReport` rule joined `policyreport_info` to the labels metric without collapsing extra labels. That error is `match group {managed_cluster_id="…"}` with the **same** cluster name. It is fixed in 2.16.3 / 2.17.1 / 5.0 ([ACM-42977](https://issues.redhat.com/browse/ACM-42977) tracks 2.14.z / 2.15.z). It does not add names to `acm_managed_cluster_info`, does not land on 2.13, and does not fix a custom join with an empty match group.
 
 | Hub version | Built-in `ViolatedPolicyReport` join | What to give the customer |
 |---|---|---|
@@ -35,7 +35,7 @@ A join **without** collapsing `acm_managed_cluster_labels` first will fail with 
 
 ---
 
-## ACM 2.13 workaround 
+## ACM 2.13 workaround (what to send the customer) 
 
 On 2.13, `acm_managed_cluster_info` and `policyreport_info` are documented as **Stable** with `managed_cluster_id` and **no** cluster name
 ([Observability 2.13](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.13/html/observability/observing-environments-intro)).
@@ -81,7 +81,9 @@ count by (managed_cluster_name, condition, status) (acm_managed_cluster_status_c
 
 ### 2.13-B — Must use `acm_managed_cluster_info`
 
-`max by` is required. `last_over_time` covers the ~10 minute overlap while both old and new `acm_managed_cluster_labels` series exist.
+Join **only** on `managed_cluster_id`. Copy `managed_cluster_name` from `acm_managed_cluster_status_condition` (immutable ManagedCluster name). `max by` collapses the many condition series; `topk` keeps one row per ID if two names ever share an ID; `last_over_time` covers Thanos scrape gaps.
+
+Do **not** join `acm_managed_cluster_labels` on `name`. `max by (managed_cluster_id, name)` does not fix an empty match group `{}`, and it does not collapse two different names for one ID.
 
 ```yaml
 apiVersion: v1
@@ -97,24 +99,24 @@ data:
           - alert: ManagedClusterUnavailable
             expr: |
               acm_managed_cluster_info{available!="True"}
-              * on (managed_cluster_id) group_left (name)
-                max by (managed_cluster_id, name) (
-                  last_over_time(acm_managed_cluster_labels[10m])
+              * on (managed_cluster_id) group_left (managed_cluster_name)
+                topk by (managed_cluster_id) (1,
+                  max by (managed_cluster_id, managed_cluster_name) (
+                    last_over_time(acm_managed_cluster_status_condition[10m])
+                  )
                 )
             for: 5m
             labels:
               severity: critical
-              cluster: "{{ $labels.name }}"
+              cluster: "{{ $labels.managed_cluster_name }}"
             annotations:
-              summary: "Cluster {{ $labels.name }} is unavailable"
-              description: "Managed cluster {{ $labels.name }} (ID: {{ $labels.managed_cluster_id }}) is not available."
+              summary: "Cluster {{ $labels.managed_cluster_name }} is unavailable"
+              description: "Managed cluster {{ $labels.managed_cluster_name }} (ID: {{ $labels.managed_cluster_id }}) is not available."
 ```
-
-A `group_left` **without** `max by` / `last_over_time` is what produces duplicate series.
 
 ### 2.13-C — Policy violations (custom rule only)
 
-Do not use the 2.13 built-in `ViolatedPolicyReport` for this. Add a custom rule:
+Do not use the 2.13 built-in `ViolatedPolicyReport` for this. Use the same status-condition lookup as 2.13-B (`managed_cluster_name`, not `name`).
 
 ```yaml
 apiVersion: v1
@@ -129,19 +131,21 @@ data:
         rules:
           - alert: CustomPolicyViolation
             expr: |
-              sum by (name, policy, severity) (
+              sum by (managed_cluster_name, policy, severity) (
                 policyreport_info{result="fail"}
-                * on (managed_cluster_id) group_left (name)
-                  max by (managed_cluster_id, name) (
-                    last_over_time(acm_managed_cluster_labels[10m])
+                * on (managed_cluster_id) group_left (managed_cluster_name)
+                  topk by (managed_cluster_id) (1,
+                    max by (managed_cluster_id, managed_cluster_name) (
+                      last_over_time(acm_managed_cluster_status_condition[10m])
+                    )
                   )
               ) > 0
             for: 1m
             labels:
               severity: "{{ $labels.severity }}"
             annotations:
-              summary: "Policy violation on cluster {{ $labels.name }}"
-              description: "Policy {{ $labels.policy }} (severity: {{ $labels.severity }}) on cluster {{ $labels.name }}."
+              summary: "Policy violation on cluster {{ $labels.managed_cluster_name }}"
+              description: "Policy {{ $labels.policy }} (severity: {{ $labels.severity }}) on cluster {{ $labels.managed_cluster_name }}."
 ```
 
 If they used `max by` and still see **two ALERT series** for one violation, check for leftover MCOA `PrometheusRules` plus MCO evaluating the same alert ([ACM-34481](https://issues.redhat.com/browse/ACM-34481)) — that is a second evaluator, not a bad join.
@@ -153,7 +157,11 @@ oc apply -f thanos-ruler-custom-rules.yaml -n open-cluster-management-observabil
 ```
 
 Confirm in Grafana Explore: `ALERTS{alertname="ManagedClusterUnavailable"}`.
-If Thanos ruler logs show `422` / `many-to-many matching not allowed`, the custom expr is still joining raw `acm_managed_cluster_labels` without the collapse.
+
+If Thanos ruler logs show `422` / `many-to-many matching not allowed`:
+
+- **`match group {}`** with two different cluster names — the join is not keyed on `managed_cluster_id` (for example `on()`, or the right side dropped the ID). Use 2.13-B/C as written. This is not ACM-30479.
+- **`match group {managed_cluster_id="…"}`** with the **same** name and extra labels — labels-metric cardinality; collapse with `max by`. That is the ACM-30479 shape (default `ViolatedPolicyReport` on 2.13).
 
 This workaround puts the name on the **alert**. It does not change 2.13 metric cardinality or ship ACM-41089.
 
@@ -229,7 +237,9 @@ Confirm `cluster` and `clusterID` appear in the label set.
 ---
  
 ## Workaround 2: Alerts Based on `acm_managed_cluster_info`
- 
+
+**2.13:** skip this section. Use **2.13-A** (preferred) or **2.13-B** (status-condition lookup). Do not copy the `acm_managed_cluster_labels` / `name` join below onto a 2.13 hub.
+
 **Where:** Same ConfigMap — `thanos-ruler-custom-rules` on the hub.
  
 **What to set:** A join in the `expr` field; use `{{ $labels.name }}` in annotations.
@@ -364,6 +374,6 @@ Custom notification templates go under the `templates:` key in `alertmanager.yam
 
 - Do not edit `thanos-ruler-default-rules` for custom alerts — use `thanos-ruler-custom-rules`. The operator manages the default ConfigMap.
 - On **2.13**, do not point customers at the built-in `ViolatedPolicyReport` for cluster name. That default join lacks the ACM-30479 `max by` collapse.
-- `acm_managed_cluster_info` does not have `managed_cluster_name` on 2.13 or 2.17. Use the collapsed join to `acm_managed_cluster_labels`, or use `acm_managed_cluster_status_condition` for availability (it does include `managed_cluster_name`).
+- `acm_managed_cluster_info` does not have `managed_cluster_name` on 2.13 or 2.17. On 2.13, look the name up from `acm_managed_cluster_status_condition` with `on (managed_cluster_id)` (2.13-B/C). For availability-only alerts, use 2.13-A and skip the join. Do not join `acm_managed_cluster_labels` on `name`.
 - Do not add Prometheus external labels on managed clusters expecting them to appear on hub-scraped metrics like `acm_managed_cluster_info` — those metrics are emitted on the hub by `clusterlifecycle-state-metrics`, not on the managed cluster.
 - Native name labels on those two metrics: [ACM-41089](https://issues.redhat.com/browse/ACM-41089) (ACM 5.1). Do not promise that on a 2.13 hub.
