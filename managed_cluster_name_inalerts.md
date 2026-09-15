@@ -35,7 +35,7 @@ A join **without** collapsing `acm_managed_cluster_labels` first will fail with 
 
 ---
 
-## ACM 2.13 workaround (what to send the customer)
+## ACM 2.13 workaround 
 
 On 2.13, `acm_managed_cluster_info` and `policyreport_info` are documented as **Stable** with `managed_cluster_id` and **no** cluster name
 ([Observability 2.13](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.13/html/observability/observing-environments-intro)).
